@@ -1,0 +1,1679 @@
+---
+title: "The OMAS Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    css: OMASstyle.css
+    logo: omas_logo_60px.png
+    favicon: favicon.ico
+runtime: shiny
+---
+<script>
+$('.navbar-logo').wrap('<a href="http://grc.osu.edu/OMAS" target=_blank>');
+</script>
+
+```{r context="setup", include=FALSE}
+library(flexdashboard)
+library(survey)
+library(RColorBrewer)
+library(magrittr)
+library(shinyBS)
+library(DT)
+library(leaflet)
+library(srvyr)
+library(plotly)
+library(dplyr)
+library(tidyr)
+library(forcats)
+library(janitor)
+library(leaflet.minicharts)
+library(sf)
+library(htmltools)
+
+source("lib/loadData.R", local = T)
+labels <- read.csv(file="data/dashboardText.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE) %>%
+  mutate(DashType = DashType %>% tolower())
+labels$VarName <- labels$VarName %>% trimws
+```
+
+# Inputs {.sidebar}
+
+```{r context="server"}
+agesLower <- reactive({
+  req(input$dash_type)
+  if(input$dash_type == "adult") adult_agesLower
+  else if (input$dash_type == "child") child_agesLower
+})
+
+agesUpper <- reactive({
+  req(input$dash_type)
+  if(input$dash_type == "adult") adult_agesUpper
+  else if (input$dash_type == "child") child_agesUpper
+})
+
+yearLower <- reactive({
+  #print(input$indicator) 
+  req(input$indicator)
+  if(input$dash_type == "adult")
+    ind_yr_a %>% filter(year != 2004 & year != 2008) %>% filter(var_name == input$indicator) %>% dplyr::distinct(year) %>% pull()
+  else if (input$dash_type == "child")
+    ind_yr_c %>% filter(year != 2004 & year != 2008) %>% filter(var_name == input$indicator) %>% dplyr::distinct(year) %>% pull()
+})
+
+yearUpper <- reactive({
+  req(input$indicator, input$yearLower)
+  if(input$dash_type == "adult")
+    ind_yr_a %>% filter(var_name == input$indicator & year >= input$yearLower) %>% dplyr::distinct(year) %>% pull()
+  else if (input$dash_type == "child")
+    ind_yr_c %>% filter(var_name == input$indicator & year >= input$yearLower) %>% dplyr::distinct(year) %>% pull()
+})
+
+output$indicatorReact <- renderUI({
+  req(input$dash_type)
+  selectInput('indicator', label = NULL, choices = 
+              if(input$dash_type == "adult") adult_indicators
+              else if (input$dash_type == "child") child_indicators)
+})
+
+output$subpopReact <- renderUI({
+  selectInput('subpop', label = NULL, choices = 
+                if(input$dash_type == "adult"){
+                  if(('2015' %in% input$yearLower)|('2017' %in% input$yearLower)) adult_subpops 
+                  else head(adult_subpops, 5)
+                }
+              else if(input$dash_type == "child"){ 
+                if(('2012' %in% input$yearLower)|('2015' %in% input$yearLower)|('2017' %in% input$yearLower)) child_subpops
+                else head(child_subpops, 4)
+              }, selected = input$subpop)
+})
+output$strataReact <- renderUI({
+  selectInput('strata', label = NULL, choices = 
+              if('subpop_male' %in% input$subpop | 'subpop_female' %in% input$subpop) stratasNoGender 
+              else stratasAll, selected = input$strata)
+})
+
+output$yearLowerReact <- renderUI({
+  selectInput('yearLower', label = NULL, choices = yearLower(), selected = head(yearLower(), 1))
+})
+
+output$yearUpperReact <- renderUI({
+  selectInput('yearUpper', label = NULL, choices = yearUpper(), selected = tail(yearUpper(), 1))
+})
+
+output$ageLowerReact <- renderUI({
+  req(input$dash_type)
+  selectInput('ageLower', label = NULL, choices = agesLower(), selected = head(agesLower(), 1))
+})
+
+output$ageUpperReact <- renderUI({
+  req(input$ageLower)
+  selectInput('ageUpper', label = NULL, choices = 
+              if('19' %in% input$ageLower) agesUpper() 
+              else if('25' %in% input$ageLower) tail(agesUpper(), 6)
+              else if('35' %in% input$ageLower) tail(agesUpper(), 5) 
+              else if('45' %in% input$ageLower) tail(agesUpper(), 4)
+              else if('55' %in% input$ageLower  | '0' %in% input$ageLower) tail(agesUpper(), 3) 
+              else if('65' %in% input$ageLower| '7' %in% input$ageLower) tail(agesUpper(), 2) 
+              else if('75' %in% input$ageLower | '13' %in% input$ageLower) tail(agesUpper(), 1), selected = tail(agesUpper(), 1))
+})
+
+output$incomeUpperReact <- renderUI({
+  selectInput('incomeUpper', label = NULL, choices = 
+              if('0' %in% input$incomeLower) fplGroupsUpper 
+              else if('101' %in% input$incomeLower) tail(fplGroupsUpper, 4) 
+              else if('151' %in% input$incomeLower) tail(fplGroupsUpper, 3) 
+              else if('201' %in% input$incomeLower) tail(fplGroupsUpper, 2) 
+              else if('301' %in% input$incomeLower) tail(fplGroupsUpper, 1), selected = tail(fplGroupsUpper, 1))
+})
+
+## accepts single data rectangle, filters data based on year
+data_react <- reactive({
+  ## dependancy on run button
+  input$run
+  isolate({
+  req(input$indicator, input$dash_type,
+      input$yearUpper, input$yearLower, 
+      input$incomeLower, input$incomeUpper, 
+      input$ageLower, input$ageUpper, 
+      input$subpop, input$strata)
+  ## select either adult or child data to be fed through year filters
+    if(input$dash_type == "child"){
+    data <- data_child_full %>%
+      filter(between(year, as.numeric(input$yearLower), as.numeric(input$yearUpper) ))
+  } else{
+    data <- data_adult_full %>%
+      filter(between(year, as.numeric(input$yearLower), as.numeric(input$yearUpper) ))
+  }
+
+   return(data)
+  })
+})
+
+estimation_react <- reactive({
+  ## dependancy on run button
+  input$run
+  isolate({
+  req(input$indicator, input$dash_type,
+      input$yearUpper, input$yearLower, 
+      input$incomeLower, input$incomeUpper, 
+      input$ageLower, input$ageUpper, 
+      input$subpop, input$strata)
+  ## conditional applicaiton of stratifier 
+  strata_cond <- ifelse(input$strata=="none", FALSE, TRUE)
+  ## conditional application of subpop
+  subpop_cond <- ifelse(input$subpop=="none", FALSE, TRUE)
+  ## conditional application of dem_var
+  dem_cond <- ifelse(input$indicator %in% dems_list, TRUE, FALSE)
+
+  ## grab data from previous reactive step
+  data <- data_react() %>% as.data.frame()
+  ## quosures for dplyr programming
+  indic1 <- sym(input$indicator)
+  subpop1 <- sym(input$subpop)
+  strata1 <- sym(input$strata)
+  indic <- enquo(indic1)
+  subpop <- enquo(subpop1)
+  strata <- enquo(strata1)
+  
+  ## age inputs can be coerced to numeric, except "75+"
+  if(input$ageUpper == "75+"){
+    ageUpper_placeHolder <- "80"
+  }else{
+    ageUpper_placeHolder <- input$ageUpper
+    }
+  
+  # generate list of selected years
+  yearlist <- data %>% dplyr::distinct(year) %>% pull()
+  totalRound <- 0
+  percRound <- 1
+  sns_num <- 5
+  sns_den <- 30
+  sns_rse <- 30
+  conflev <- qnorm(.95)
+  
+  ## lists for holding results
+  sns <- list()
+  res <- list()
+
+  for(i in seq_along(yearlist)){
+    ##################
+    ### small number suppression block
+    ## using if/then sinec group_by verbs can't be chained (last one overrides previous ones)
+    
+    ## small numbers block works the same for demographic variables and indicator variables
+    if(input$strata == "none"){
+      ##########
+      ## no stratification
+      try(data %>%
+            filter(year==yearlist[i]) %>%
+            ## conditional application of subpop filter
+            cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+            filter(!is.na(!!indic1)) %>%
+            ## between is a base function, don't need sym/quo functions, just input$thing
+            ## between is inclusive of endpoints
+            filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+            filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+            group_by(!!indic1) %>%
+            tally() %>%
+            spread(!!indic1, n) %>%
+            #create dummy column so adorn_ includes first column-only needed in dichot/nostrat case
+            mutate(dummy = "dummy") %>%
+            select(dummy, everything()) %>%
+            adorn_totals("col") %>%
+            select(-dummy) %>%
+            gather(!!indic1, n, 1:(ncol(.)-1)) %>%
+            mutate(year = yearlist[i]) %>%
+            rename("numerator" = "n", "denominator" = "Total") %>% 
+            cond_filter(!!indic1 == 1, execute=!dem_cond) -> sns[[i]], silent = TRUE)
+    }else{
+      ##########
+      ## stratification
+      try(data %>%
+            filter(year==yearlist[i]) %>%
+            cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+            filter(!is.na(!!indic1)) %>%
+            filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+            filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+            group_by(!!!strata1, !!indic1) %>%
+            tally() %>%
+            spread(!!indic1, n) %>%
+            adorn_totals("col") %>%
+            gather(!!indic1, n, 2:(ncol(.)-1)) %>%
+            mutate(year = yearlist[i]) %>%            
+            rename("numerator" = "n", "denominator" = "Total")  %>%
+            cond_filter(!!indic1 == 1, execute=!dem_cond) -> sns[[i]], silent = TRUE)
+    }
+    
+    ### estimation block - one for indicators, one for demographics
+    if(input$indicator %in% dems_list){
+      ###################
+      ### estimation block for demographic variables
+      if(strata_cond == FALSE){
+        #########
+        ## no stratification
+      try(data %>%
+            filter(year==yearlist[i]) %>%
+            ## generate unique survey design object for each year
+            as_survey_design(ids = 1,
+                             strata = stratum,
+                             weights = wt,
+                             lonely.psu=getOption("survey.lonely.psu"),
+                             na.rm = TRUE) %>%
+            ## apply subpopulation filter conditionally
+            cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+            ## don't show NA rows
+            filter(!is.na(!!indic1)) %>%
+            ## filter respondents by specified ages
+            filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+            ## filter respondents by specified FPL range
+            filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+            ## apply stratification conditionally
+            group_by( !!indic1) %>%
+            ## calculate point estimates
+            summarize(percEst = survey_mean( vartype = "se", na.rm=TRUE),
+                      totalEst = survey_total( vartype = "se", na.rm=TRUE)) %>%
+            ## calculate additional values needed for tables/plots  
+            mutate(indicator = !!indic1,
+                   percEst = percEst %>% multi100(),
+                   percEst_me = 100 * percEst_se * conflev,
+                   percEst_l = (percEst - percEst_me) %>% round(percRound),
+                   percEst_u = (percEst + percEst_me) %>% round(percRound),
+                   totalEst = totalEst,
+                   totalEst_me = totalEst_se * conflev,
+                   totalEst_l = (totalEst - totalEst_me) %>% round(totalRound),
+                   totalEst_u = (totalEst + totalEst_me) %>% round(totalRound),
+                   year = yearlist[i]) %>%
+            mutate(percEst = percEst %>% round(percRound),
+                   totalEst = totalEst %>% round(totalRound),
+                   percEst_me = percEst_me %>% round(percRound)) -> res[[i]] , silent = TRUE) 
+      }else{
+        ##########
+        ## stratification
+      try(data %>%
+            filter(year==yearlist[i]) %>%
+            ## generate unique survey design object for each year
+            as_survey_design(ids = 1,
+                             strata = stratum,
+                             weights = wt,
+                             lonely.psu=getOption("survey.lonely.psu"),
+                             na.rm = TRUE) %>%
+            ## apply subpopulation filter conditionally
+            cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+            ## don't show NA rows
+            filter(!is.na(!!indic1)) %>%
+            ## filter respondents by specified ages
+            filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+            ## filter respondents by specified FPL range
+            filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+            ## apply stratification conditionally
+            group_by(!!!strata, !!indic1) %>%
+            ## calculate point estimates
+            summarize(percEst = survey_mean( vartype = "se", na.rm=TRUE),
+                      totalEst = survey_total( vartype = "se", na.rm=TRUE)) %>%
+            ## calculate additional values needed for tables/plots  
+            mutate(indicator = !!indic1,
+                   percEst = percEst %>% multi100(),
+                   percEst_me = 100 * percEst_se * conflev,
+                   percEst_l = (percEst - percEst_me) %>% round(percRound),
+                   percEst_u = (percEst + percEst_me) %>% round(percRound),
+                   totalEst = totalEst,
+                   totalEst_me = totalEst_se * conflev,
+                   totalEst_l = (totalEst - totalEst_me) %>% round(totalRound),
+                   totalEst_u = (totalEst + totalEst_me) %>% round(totalRound),
+                   year = yearlist[i]) %>%
+            mutate(percEst = percEst %>% round(percRound),
+                   totalEst = totalEst %>% round(totalRound),
+                   percEst_me = percEst_me %>% round(percRound) ) -> res[[i]] , silent = TRUE)        
+      }
+    }else{
+      ### estimation block for indicator variables      
+    try(data %>%
+          filter(year==yearlist[i]) %>%
+          ## generate unique survey design object for each year
+          as_survey_design(ids = 1,
+                           strata = stratum,
+                           weights = wt,
+                           lonely.psu=getOption("survey.lonely.psu"),
+                           na.rm = TRUE) %>%
+          ## apply subpopulation filter conditionally
+          cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+          ## don't show NA rows
+          filter(!is.na(!!indic1)) %>%
+          ## filter respondents by specified ages
+          filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+          ## filter respondents by specified FPL range
+          filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+          ## apply stratification conditionally
+          cond_group_by(!!!strata1, execute=strata_cond) %>%
+           ## calculate point estimates
+          summarize(percEst = survey_mean(!!indic1, vartype = "se", na.rm=TRUE),
+                    totalEst = survey_total(!!indic1, vartype = "se", na.rm=TRUE)) %>%
+          ## calculate additional values needed for tables/plots  
+          mutate(indicator = 1,
+                 percEst = percEst %>% multi100(),
+                 percEst_me = 100 * percEst_se * conflev,
+                 percEst_l = (percEst - percEst_me) %>% round(percRound),
+                 percEst_u = (percEst + percEst_me) %>% round(percRound),
+                 totalEst = totalEst,
+                 totalEst_me = totalEst_se * conflev,
+                 totalEst_l = (totalEst - totalEst_me) %>% round(totalRound),
+                 totalEst_u = (totalEst + totalEst_me) %>% round(totalRound),
+                 year = yearlist[i]) %>%
+          mutate(percEst = percEst %>% round(percRound),
+                 totalEst = totalEst %>% round(totalRound),
+                   percEst_me = percEst_me %>% round(percRound)) ->  res[[i]] , silent = TRUE)
+    }
+  }  
+    ## this part is the same regardless of variable type
+    
+  ## rowbind all ouput from the sns steps
+  sns <- sns %>% bind_rows() %>% cond_rename(strata = !!strata1, execute=strata_cond) 
+  ## rowbind all ouput from the estimation step
+  res <- res %>% bind_rows() %>% cond_rename(strata = !!strata1, execute=strata_cond)  %>%
+    ## combine with ouput from sns 
+    right_join(sns) %>% 
+
+    ## conditionally filter out missing stratifier rows
+    cond_filter(strata != "", execute=strata_cond ) %>%
+    ## return true or false for each SNS condition
+    mutate(rse_suppress = ifelse((percEst_u - percEst)/conflev/percEst>sns_rse,TRUE,FALSE))  %>%
+    mutate(ct_suppress= ifelse(numerator<sns_num | denominator < sns_den , TRUE, FALSE)) %>%
+    mutate(cell_suppress = ifelse(rse_suppress == TRUE | ct_suppress == TRUE, TRUE, FALSE )) %>%
+    ## drop unnecessary columns
+    select(-numerator, -denominator, -rse_suppress, -ct_suppress) 
+  
+  ## in case of cell_suppress coming up empty, default to suppress
+  res$cell_suppress[is.na(res$cell_suppress)] <- TRUE
+  
+  ## replace suppressed values with NA
+  res[res$cell_suppress==TRUE, c('percEst', 'percEst_l', 'percEst_u', 'totalEst', 'totalEst_l', 'totalEst_u')] <- NA
+  
+  res <- res %>% 
+    select(-cell_suppress) %>%
+    mutate(indicator = ifelse(indicator==1, paste0(labels[(labels$VarName == input$indicator & labels$DashType == input$dash_type), "Interface_label"]), indicator)) %>%
+    filter(indicator != "") %>%
+    cond_filter(!!!strata1 !="", execute = strata_cond)
+  
+  return(res)
+  })
+})
+
+
+
+overallTable <- reactive({
+  ## dependancy on run button
+  input$run
+  isolate({
+   req(input$indicator, input$dash_type, 
+       input$yearUpper, input$yearLower, 
+       input$incomeLower, input$incomeUpper, 
+       input$ageLower, input$ageUpper, 
+       input$subpop, input$strata)
+   #### need to set up csv for labels dataframe similar to what we have in OPAS
+  ## code something like indic_col <- data.frame(indicator=rep(as.character(labels[input$indicator == labels$VarName, "Interface_label"]), rownum))    
+  # EG from OPAS: Maybe come back to this
+          # indic_col <- data.frame(indicator=rep(as.character(labels[input$indicator == labels$VarName, "Interface_label"]), rownum))
+        # 
+        #   output <- indic_col %>% cbind(design_react() %>% #filter(!! indic1 !="") %>%
+        # #  group_by(!! indic1) %>%
+        #   summarize( percEst = survey_mean(!!indic1, vartype = "ci", na.rm=TRUE),
+        #              totalEst = survey_total(!!indic1, vartype = "ci", na.rm=TRUE)))
+        # 
+  
+  ## odde01 NB and review for caption.
+  ## set up values for columns at beginning of table
+  age_cell <-  ifelse( input$ageUpper == "75+" , 
+                       paste0( input$ageLower , " Years and Older"), 
+                       paste0(input$ageLower, " to ", input$ageUpper ))
+  income_cell <- ifelse( input$incomeUpper == "501", 
+                         paste0(input$incomeLower, "% or More FPL"), 
+                         paste0(input$incomeLower, "% to ", input$incomeUpper, "% FPL"))
+  subpop_cell <- ifelse(input$dash_type == "adult",
+                        switch(input$subpop,
+                               "none" = "No subpopulation",
+                               "subpop_female" = "Female",
+                               "subpop_male" = "Male",
+                               "filter_specialhealth" = "Adults with Special Health Care Needs",
+                               "filter_dd" = "Adults with a disability"),
+                        switch(input$subpop,
+                               "none" = "No subpopulation",
+                               "subpop_female" = "Female",
+                               "subpop_male" = "Male",
+                               "filter_specialhealth" = "Children with Special Health Care Needs",
+                               "filter_dd" = "Children with a disability")) 
+  
+
+  
+  adult_subpops <-  c("All"="none", 
+              "Males"="subpop_male", 
+              "Females"="subpop_female", 
+              "Special Health Care Needs"="filter_specialhealth", 
+              "Adults with a disability"="filter_dd")
+
+child_subpops <-  c("All" = "none",
+                    "Males"="subpop_male", 
+                    "Females"="subpop_female", 
+                    "Special Health Care Needs"="filter_specialhealth",
+                    "Disability"="filter_disability")
+  
+  ## maybe need strat/nostat ifthen here
+  if(input$strata == "none"){
+      tab_le <- estimation_react() %>% as.data.frame() %>% 
+
+  ## need to add strat column, age column, income column
+    mutate(
+      ## might need quosures here
+      strata =  "No Stratification",
+      Ages = age_cell,
+      Income = income_cell,
+      Subpop = subpop_cell) %>% ### placeholder for now
+       ## remove unnecesary columns, reorder columns
+    select(indicator, year, strata, Subpop, Ages, Income,
+           percEst,  percEst_l, percEst_u, -percEst_me, -totalEst_me,
+           totalEst,  totalEst_l, totalEst_u) 
+  }else{
+      tab_le <- estimation_react() %>% as.data.frame() %>% 
+    mutate(
+      Ages = age_cell,
+      Income = income_cell,
+      Subpop = subpop_cell) %>%
+       ## remove unnecesary columns, reorder columns
+    select(indicator, year, strata, Subpop, Ages, Income,
+           percEst,  percEst_l, percEst_u, -percEst_me, -totalEst_me,
+           totalEst,  totalEst_l, totalEst_u) 
+  }
+
+  return(tab_le)
+  })
+})
+
+finalTitle <- reactive({
+  ## dependancy on run button
+  input$run
+  isolate({
+    req(input$dash_type, input$indicator, input$strata)
+    ## Initialize
+    if(input$dash_type == "adult")
+      plotTitle <- as.character(labels[input$indicator == labels$VarName & labels$DashType=="adult", "Title"])
+    else if(input$dash_type == "child")
+      plotTitle <- as.character(labels[input$indicator == labels$VarName & labels$DashType=="child", "Title"])
+  
+    # if(input$strata != "none") { ## a stratifier is applied
+         plotTitle <- plotTitle
+    # }
+#  return(toTitleCase(plotTitle))
+    return(plotTitle)
+  })
+})
+
+finalCaption <- renderText({
+  input$run
+  isolate({
+    req(input$dash_type, input$indicator, input$strata)
+    ## spaces are incorporated at the end of a string chunk, except for at the very end
+    label_subpop1 <- ifelse(input$subpop %in% c("subpop_male", "subpop_female"),
+                        switch(input$subpop,
+                               "subpop_female" = "Female ",
+                               "subpop_male" = "Male "),
+                        "")
+    label_dashtype <- ifelse(input$dash_type == "adult", "adults ", "children ")
+    label_subpop2 <- ifelse(input$subpop %in% c("filter_specialhealth", "filter_disability"),
+                        switch(input$subpop,
+                               "filter_specialhealth" = "with a special health care need ",
+                               "filter_disability" = "with a disability "),
+                        "")
+    label_age <-  ifelse(input$ageUpper == "75+" , 
+                     paste0("ages ", input$ageLower , " and older, "), 
+                     paste0("between ages ", input$ageLower, " and ", input$ageUpper, ", " ))
+    label_income <- ifelse(input$incomeUpper == "501", 
+                       paste0("with incomes of ", input$incomeLower, "% or more FPL"), 
+                       paste0("with incomes between ", input$incomeLower, "% to ", input$incomeUpper, "% FPL"))
+    label_strat <- ifelse(input$strata == "none", 
+                      ".",
+                      switch(input$strata,
+                             "dem_gender" = ", stratified by gender.",
+                             "dem_raceeth" = ", stratified by race.",
+                             "dem_countytype" = ", stratified by county type.",
+                             "geo_aaa" = ", stratified by Area Agency on Aging region.",
+                             "geo_adamh" = ", stratified by Alcohol, Drug and Mental Health region.",
+                             "geo_oei" = ", stratified by Ohio Equity Institute classification."))
+      ##JP: sorry i know this is somewhat inelegant...
+    line1 <- paste0(label_subpop1, "Ohio ", label_dashtype, label_subpop2, label_age, label_income, label_strat)
+    line2 <- "Some results may be suppressed if insufficient data is available to compute a stable estimate."
+    caption <- HTML(paste( line1, line2,  sep = "<br/>"))
+
+    return(caption)
+  })
+})
+
+## Initial modal
+observeEvent(
+  input$dash_type,
+  ignoreNULL = FALSE, {
+    showModal(
+      modalDialog(
+        title = ("Welcome to the Ohio Medicaid Assessment Survey dashboard!")
+        , tags$p("This interactive dashboard provides real-time estimation of key healthcare and public health indicators for Ohio's adults and children, using data from the Ohio Medicaid Assessment Surveys.")
+        , tags$p("The ", tags$strong("Welcome"), " tab descibes how to use the dashboard and interpret outputs.")
+        , tags$p("Make selections in the left-hand sidebar, then click the "
+                 , tags$span("COMPUTE ESTIMATES", style="background-color:#4385cb;color:#FFFFFF")
+                 ," button. Click the "
+                 , tags$strong("Graph, Table,")
+                 , " and "
+                 , tags$strong("Map")
+                 , " tabs at the top to select the kind of output you want to view.")
+        #      , tags$p("Click the button below or press the <esc> key on your keyboard to get rid of this message and get started!")
+        , tags$p(
+          "For more information about the Ohio Medicaid Assessment Surveys, please visit the "
+          , tags$a(href="http://grc.osu.edu/OMAS", "OMAS project page.")
+        )
+        , tags$div (
+          tags$img(
+            src= base64enc::dataURI(
+              file="www/NewOMASlogo.png"
+              , mime="image/png"
+            )
+            , height="15%"
+            , width="15%"
+            , alt=""
+          )
+          , HTML("&nbsp") ## these particular logos lack adequate horizontal spacing on their own
+          , tags$img(
+            src= base64enc::dataURI(
+              file="www/MedTAPPlogo-transparentbackground.png"
+              , mime="image/png"
+            )
+            , height="14%"
+            , width="14%"
+            , alt=""
+          )
+          , HTML("&nbsp") ## these particular logos lack adequate horizontal spacing on their own
+          , tags$img(
+            src= base64enc::dataURI(
+              file="www/odm-logo-no-admin-color.jpg"
+              , mime="image/png"
+            )
+            , height="25%"
+            , width="25%"
+            , alt=""
+          )
+          , HTML("&nbsp") ## these particular logos lack adequate horizontal spacing on their own
+          , tags$img(
+            src= base64enc::dataURI(
+              file="www/ODH_logo.png"
+              , mime="image/png"
+            )
+            , height="18%"
+            , width="18%"
+            , alt=""
+          )
+          , tags$img(
+            src= base64enc::dataURI(
+              file="www/logo_stacked_small.png"
+              , mime="image/png"
+            )
+            , height="14%"
+            , width="14%"
+            , alt=""
+          )
+          , align="center"
+        ) # end div
+        , footer = modalButton(tags$strong("Click to get started..."))
+        , size = c("l")
+        , easyClose = TRUE
+      )
+    )
+  })
+
+
+# renderUI({
+#   toggleModal(session, "startupModal", toggle = "open")
+# })
+
+
+```
+
+```{r context="render"}
+#----
+br() #break line
+# select child or adult
+radioButtons('dash_type', 
+             label = strong('Select dashboard type:', 
+                            bsButton("q1", label = "", icon = icon("question"), style = "light", size = "extra-small"),
+                            bsTooltip(id = "q1", title = as.character(poptext[poptext$id=="q1", "text"]),
+                                      placement = "right", 
+                                      trigger = "hover", 
+                                      options = list(container = "body"))), 
+             choices = c("Adult" = "adult", "Child" = "child"), inline = TRUE)
+hr() # horizontal line
+
+# select indicator (dropdown)
+strong('Select an Indicator:', bsButton("q2", label = "", icon = icon("question"), style = "light", size = "extra-small"),
+                               bsTooltip(id = "q2", title = as.character(poptext[poptext$id=="q2", "text"]),
+                                        placement = "right", 
+                                        trigger = "hover", 
+                                        options = list(container = "body")))
+fluidRow(
+  column(12, uiOutput("indicatorReact"))
+)
+hr() #horizontal line
+
+#----
+# select year range (dropdowns)
+strong('Select Year(s):', bsButton("q3", label = "", icon = icon("question"), style = "light", size = "extra-small"),
+                          bsTooltip(id = "q3", title = as.character(poptext[poptext$id=="q3", "text"]),
+                                    placement = "right", 
+                                    trigger = "hover", 
+                                    options = list(container = "body")))
+
+fluidRow(
+  column(6, uiOutput("yearLowerReact")),
+  column(6, uiOutput("yearUpperReact"))
+)
+hr() #horizontal line
+
+#----
+# select subpopulation (dropdown)
+strong('Subpopulation:', bsButton("q4", label = "", icon = icon("question"), style = "light", size = "extra-small"),
+                         bsTooltip(id = "q4", 
+                                   title = as.character(poptext[poptext$id=="q4", "text"]),
+                                   placement = "right", 
+                                   trigger = "hover", 
+                                   options = list(container = "body")))
+fluidRow(
+  column(12, uiOutput("subpopReact"))
+)
+hr() #horizontal line
+
+#----
+# select age range (dropdowns)
+strong('Age Range (years):', bsButton("q5", label = "", icon = icon("question"), style = "light", size = "extra-small"),
+                             bsTooltip(id = "q5", 
+                                       title = as.character(poptext[poptext$id=="q5", "text"]),
+                                       placement = "right", 
+                                       trigger = "hover", 
+                                       options = list(container = "body")))
+fluidRow(
+  column(6, uiOutput("ageLowerReact")),
+  column(6, uiOutput("ageUpperReact"))
+)
+hr() #horizontal line
+
+#----
+# select income range (dropdowns)
+strong('Income Range (%FPL):', bsButton("q6", label = "", icon = icon("question"), style = "light", size = "extra-small"),
+                               bsTooltip(id = "q6", title = as.character(poptext[poptext$id=="q6", "text"]),
+                                        placement = "right", 
+                                        trigger = "hover", 
+                                        options = list(container = "body")))
+fluidRow(
+  column(6, selectInput('incomeLower', label = NULL, choices = fplGroupsLower)),
+  column(6, uiOutput("incomeUpperReact"))
+)
+hr() #horizontal line
+
+#----
+# select stratification (dropdown)
+strong('Stratification:', bsButton("q8", label = "", icon = icon("question"), style = "light", size = "extra-small"),
+                         bsTooltip(id = "q8", 
+                                   title = as.character(poptext[poptext$id=="q8", "text"]),
+                                   placement = "right", 
+                                   trigger = "hover", 
+                                   options = list(container = "body")))
+fluidRow(
+  column(12, uiOutput("strataReact"))
+)
+hr() #horizontal line
+
+#----
+# run button
+tipify(
+  actionButton(
+    "run", "Compute Estimates", icon('refresh'), width = '100%', style = "color: #fff; background-color: #4385cb; border-color: #2e6da4"
+    )
+  , "Click this button to create outputs based on your selections, and click the Graph or Table or Map tabs to load the results!"
+)
+
+bsModal(id = 'startupModal', title = 'XXX', trigger = '',
+            size = 'large', p("Please click COMPUTE ESTIMATES"))
+
+
+```
+
+# Welcome
+
+```{r context="server"}
+
+```
+
+```{r context="render"}
+includeHTML("help.html")
+```
+
+# Graph
+
+```{r context="server"}
+
+## need to figure out what limits to use for y axis
+## need to figure out/fix colors for bars/lines/points
+
+
+### when incorporating into shiny
+### https://plot.ly/r/shiny-tutorial/
+### output$plot <- renderPlotly({ estimation_react() %>% plotly() })
+### color argument maps a variable to the colors
+### colors argument is what colors to use
+
+
+## macros to change ylimits for plots if we decide to fix them 
+ulim <- 100
+llim <- 0
+
+output$graph <- renderPlotly({
+  ## dependancy on run button
+  input$run
+  isolate({
+  req(input$indicator, input$dash_type,
+      input$yearUpper, input$yearLower, 
+      input$incomeLower, input$incomeUpper, 
+      input$ageLower, input$ageUpper, 
+      input$subpop, input$strata)
+    validate(
+      need(!(input$indicator == 'dem_raceeth' && input$strata == 'dem_raceeth'), "\n\n     Indicator and stratification variable cannot be the same. Please adjust one of your selections to generate results."),
+      need(!(input$indicator == 'dem_gender' && input$strata == 'dem_gender'), "\n\n     Indicator and stratification variable cannot be the same. Please adjust one of your selections to generate results.")
+    )
+  ## grab data from reactive step
+  data <- estimation_react() %>% as.data.frame()
+  yearlist <- data %>% dplyr::distinct(year) %>% pull()
+  
+  ## need to set up so that 
+  l_indic <- data %>% dplyr::distinct(indicator) %>% pull() %>% length()
+  if(input$strata != "none"){
+    l_strata <- data %>% dplyr::distinct(strata) %>% pull() %>% length()
+  }else{ l_strata <- 1}
+  n_items <- max(l_indic, l_strata )
+  if(input$indicator %in% dems_list){
+    l_mult <- l_indic*l_strata
+    n_items <- max(n_items, l_mult)
+  
+  }
+  
+  
+  ## if/then logic to decide between trend/bar
+  ## as well as stratified or not
+  if(length(yearlist)>1){
+    if(input$strata == "none"){
+      ### multi year (ie trend), no strat
+      if(input$indicator %in% dems_list){
+        ### demo, no strat, trend
+        p <- plot_ly( data,
+                      x = data$year,
+                      y = data$percEst,
+                      type = "scatter",
+                      mode = "lines",
+                      line = list(dash = "dash"),
+                      showlegend = FALSE,
+                      color = data$indicator,
+                      colors = barColors[-6],
+                      name = data$indicator,
+                      hoverlabel = list(namelength = -1)) %>%
+          add_markers(error_y = ~list(type = "data",
+                                      array = data$percEst_me,
+                                      colors = barColors[-6],
+                                      name = data$indicator),
+                      showlegend = TRUE) 
+      }else{
+        ### indic, no strat, trend
+        p <- plot_ly( data,
+                      x = data$year,
+                      y = data$percEst,
+                      color = data$strata,
+                      type = "scatter",
+                      mode = "lines",
+                      line = list(dash = "dash"),
+                      showlegend = FALSE,
+                      line = list(color = "#700D1C"),
+                      marker = list(color ="#700D1C" ),
+                      name = data$indicator,
+                      hoverlabel = list(namelength = -1)) %>%
+          add_markers(error_y = ~list(type = "data",
+                                      array = data$percEst_me,
+                                      color = "#700D1C"),
+                      name = data$indicator,
+                      showlegend = TRUE) %>%
+          layout(xaxis = list(title = "Survey Year",
+                              tickvals=yearlist))
+      }
+    }else{
+      ### multi year (ie trend),  strat
+      if(input$indicator %in% dems_list){
+        ### demo, strat, trend
+        p <-  plot_ly( data,
+                       x = data$year,
+                       y = data$percEst,
+                       color = data$strata,
+                       symbol = data$indicator,
+                       type = "scatter",
+                       mode = "lines",
+                       line = list(dash = "dash"),
+                       colors = barColors[-6],
+                       showlegend = FALSE,
+                      hoverlabel = list(namelength = -1)) %>%
+          add_markers(error_y = ~list(type = "data",
+                                      array = data$percEst_me,
+                                      colors = barColors[-6]),
+                      showlegend = TRUE) %>%
+          layout(xaxis = list(title = "Survey Year",
+                              tickvals=yearlist))
+        
+      }else{
+        ### indic, strat, trend
+      p <-  plot_ly( data,
+                     x = data$year,
+                     y = data$percEst,
+                     color = data$strata,
+                     type = "scatter",
+                     mode = "lines",
+                     line = list(dash = "dash"),
+                     colors = barColors[-6],
+                     showlegend = FALSE,
+                      hoverlabel = list(namelength = -1)) %>%
+        add_markers(error_y = ~list(type = "data",
+                                    array = data$percEst_me,
+                                    colors = barColors[-6]),
+                    showlegend = TRUE) %>%
+          layout(xaxis = list(title = "Survey Year",
+                              tickvals=yearlist))
+      }
+    }
+  }else{
+    if(input$strata == "none"){
+      ### single year (ie bar), no strat
+       if(input$indicator %in% dems_list ){
+         ### dem, nostrat, bar
+ 
+     p <-   plot_ly(data,
+                     x = data$indicator,
+                     y = data$percEst,
+               #     color = data$indicator,
+                     type = "bar",
+                     color = I("#700D1C"),
+                     marker = list(color = "#700D1C" ),
+                     showlegend = FALSE,
+                      hoverlabel = list(namelength = -1),
+                     error_y = ~list(type = "data",
+                                     array = data$percEst_me,
+                                     color = "black")) 
+       }else{
+         ### indic, no strat, bar
+      p <-   plot_ly(data,
+                     x = data$indicator,
+                     y = data$percEst,
+                     type = "bar",
+                     color = I("#700D1C"),
+                     marker = list(color = "#700D1C" ),
+                     showlegend = FALSE,
+                      hoverlabel = list(namelength = -1),
+                     error_y = ~list(type = "data",
+                                     array = data$percEst_me,
+                                     color = "black"))     
+      }
+    }else{
+      ### single year (ie bar),  strat
+      if(input$indicator %in% dems_list){
+        ### dem strat bar
+        
+        p <-  plot_ly(data,
+                      x = data$indicator,
+                      y = data$percEst,
+                      color = data$strata,
+                      type = "bar",
+                      showlegend = FALSE,
+                      colors = barColors[-6],
+                      hoverlabel = list(namelength = -1),
+                      error_y = ~list(type = "data",
+                                      array = data$percEst_me,
+                                      color = "black"))
+      }else{
+        ### indic strat bar
+      p <-  plot_ly(data,
+                    x = data$strata,
+                    y = data$percEst,
+                    type = "bar",
+                    showlegend = FALSE,
+                    marker = ~list(color = barColors),
+                      hoverlabel = list(namelength = -1),
+                    error_y = ~list(type = "data",
+                                    array = data$percEst_me,
+                                    color = "black")) 
+             }
+    } }
+  p <- p %>%  
+    layout(#xaxis = list(title = "Survey Year"),
+           yaxis = list( range=c(llim,ulim), title = "Estimated Percentage"),
+           legend = list(orientation = 'h'),
+           margin = list(l = 50, r = 50, t = 60, b = 100),
+           # annotations = list(text = paste0("<b>","Ohio Medicaid Assessment Survey Series ",input$yearLower, " - ", input$yearUpper, "</b>"),  
+           #                    font = list(size = 12, color = "#D3D3D3"),
+           #                    showarrow = FALSE,
+           #                    x = 1, ## proportion for location of x coordinate -> 1 means far right (contingent on what xref is set to)
+           #                    xref = "paper", #makes x parameter a proportion of the plot
+           #                    xanchor = "right", #sets the text box's horizontal position anchor
+           #                    y = -0.05, ## proportion for location y cordinate -> 0 means very bottom (contingent on what yref is set to)
+           #                    yref = "paper", #makes y parameter a proportion of the plot
+           #                    yanchor = "top" #sets the text box's vertical position anchor
+           #                    )
+           annotations = list(text = paste0("<b>","Preliminary: For Demonstration Only ","</b>"),  
+                              font = list(size = 30, color = "#D3D3D3"),
+                              textangle = -30,
+                              opacity = 0.3,
+                              showarrow = FALSE,
+                              x = 0.7, ## proportion for location of x coordinate -> 1 means far right (contingent on what xref is set to)
+                              xref = "paper", #makes x parameter a proportion of the plot
+                              xanchor = "right", #sets the text box's horizontal position anchor
+                              y = 0.7, ## proportion for location y cordinate -> 0 means very bottom (contingent on what yref is set to)
+                              yref = "paper", #makes y parameter a proportion of the plot
+                              yanchor = "top" #sets the text box's vertical position anchor
+                              )
+           ) %>%
+    config( displaylogo = FALSE, 
+            collaborate = FALSE) 
+#            displayModeBar = FALSE)
+  
+  if(n_items > 10){p %>% hide_legend( ) 
+  }else{
+    p 
+    }
+  })
+})
+
+
+```
+
+```{r context="render"}
+div(class="omastitle", renderText(finalTitle())
+)
+div(style='height:750px; overflow-y: scroll; position: relative; display: block;', tags$img(src = "spinner.gif", id = "loading-spinner"),
+plotlyOutput("graph")
+# verbatimTextOutput("event")
+)
+div(class="omascaption", renderUI(HTML(paste(finalCaption(),
+                                           "Error bars represent the 90% confidence interval and represent the uncertainty in the estimate.", 
+                                           sep = "<br/>")))
+)
+
+```
+
+# Table
+
+```{r context="server"}
+
+output$table <- renderDataTable({
+  ## dependancy on run button
+  input$run
+  isolate({
+     req(input$indicator, input$dash_type,
+      input$yearUpper, input$yearLower, 
+      input$incomeLower, input$incomeUpper, 
+      input$ageLower, input$ageUpper, 
+      input$subpop, input$strata)
+  validate(
+      need(!(input$indicator == 'dem_raceeth' && input$strata == 'dem_raceeth'), "\n\n     Indicator and stratification variable cannot be the same. Please adjust one of your selections to generate results."),
+      need(!(input$indicator == 'dem_gender' && input$strata == 'dem_gender'), "\n\n     Indicator and stratification variable cannot be the same. Please adjust one of your selections to generate results.")
+    )
+  datatable(overallTable() %>% mutate(
+    totalEst = totalEst %>% prettyNum( big.mark = ",", trim=TRUE),
+    totalEst_l = totalEst_l %>% prettyNum( big.mark = ",", trim=TRUE),                  
+    totalEst_u = totalEst_u %>% prettyNum( big.mark = ",", trim=TRUE)), 
+            extensions = 'Buttons',
+            rownames = FALSE,
+            options = list(digits=3, 
+                           scrollY = '500px',
+                           paging=FALSE,
+                           dom = 'Bfrtip', buttons = c('copy', 'excel', 'pdf', 'print', 'colvis')),
+            caption = htmltools::tags$caption(
+                      style = 'caption-side: top; text-align: center; color:black; font-size: 16px;',
+                      htmltools::strong(finalTitle())),
+            callback = htmlwidgets::JS("
+                var tips = ['Row Number','Indicator from Survey', 'Year of Survey', 'Stratification', 'Subpopulation after Filtering',
+                            'Responder Age', 'Responder Income','Estimated %','90% Confidence Interval Lower Bound Percentage', '90% Confidence Interval Upper Bound Percentage','Estimated Total Count','90% Confidence Interval Lower Bound Total','90% Confidence Interval Upper Bound Total'],
+                    header = table.columns().header();
+                for (var i = 0; i < tips.length; i++) {
+                  $(header[i]).attr('title', tips[i]);
+                }
+            "),
+            colnames = c(
+              "Survey Indicator",
+              "Survey Year",
+              "Stratifier",
+              "Subpopulation",
+              "Ages",
+              "Income",
+              "Estimated Percentage",
+              "90% CI LB Percentage",
+              "90% CI UB Percentage",
+              "Estimated Total",
+              "90% CI LB Total",
+              "90% CI UB Total"
+              ))
+  })
+})
+```
+
+```{r context="render"}
+div(style='position: relative; display: block;', tags$img(src = "spinner.gif", id = "loading-spinner"),dataTableOutput("table")
+)
+div(class="omascaption", renderUI(HTML(finalCaption()))
+)
+```
+
+# Map
+
+```{r context="server"}
+
+### jp - leaflet stuff here
+## some of this process should be moved to the "header" so it's not repeated every time
+
+### when incorporating into shiny
+### https://rstudio.github.io/leaflet/shiny.html
+### output$mymap <- renderLeaflet({ leaflet() %>% addTiles()})
+
+output$cn_map <- renderLeaflet({
+  ## dependancy on run button
+  input$run
+  isolate({
+  req(input$indicator, input$dash_type,
+      input$yearUpper, input$yearLower, 
+      input$incomeLower, input$incomeUpper, 
+      input$ageLower, input$ageUpper, 
+      input$subpop, input$strata)
+  validate(
+    need(!(input$strata == "dem_raceeth" || input$strata == 'dem_gender'), "\n     Stratification by demographics (gender and race-ethnicity) is not allowed in maps. Please modify your selection.")
+  )
+  
+  subpop1 <- sym(input$subpop)
+  strata1 <- sym(input$strata)
+  
+  subpop <- enquo(subpop1)
+  strata <- enquo(strata1)
+  
+  ageUpper_placeHolder <- input$ageUpper
+  if(input$ageUpper == "75+"){ageUpper_placeHolder <- "80"}
+  
+  ## set zoom level
+  zoom_lev <- 7.5
+  ## set minichart size
+  m_ch_size <- 30
+  
+  ## assign dplyr conditional for stratification and subpop
+  subpop_cond <- ifelse(input$subpop=="none", FALSE, TRUE)
+  strata_cond <- ifelse(input$strata=="none", FALSE, TRUE)
+  
+  ## make copy of spatial polygon dataframe to avoid writing over original
+  ohio1 <- ohio
+  ## quosures
+  indic1 <- sym(input$indicator)
+  indic <- enquo(indic1)
+  ## filter data to only include most recent year
+  data <- data_react() %>% as.data.frame() %>% 
+    filter(year == as.numeric(input$yearUpper))  
+  
+  ## "macros"
+  totalRound <- 0
+  percRound <- 1
+  sns_num <- 5
+  sns_den <- 30
+  sns_rse <- 30
+  conflev <- qnorm(.95)
+  
+  if(input$indicator %in% dems_list){
+    if(input$strata %in% geo_strata){
+      ########################
+      ##  demographic variables for customized ohio maps for adamh, aaa, oei, county_type
+      ##  places piecharts via minicharts onto clusters of counties 
+      
+      ## convert input$strata string to symbol
+      geostrat1 <- sym(input$strata)
+      
+      ## assign selected county clustering
+      if(input$strata == "geo_adamh") { oh_shape <- ohio_adamh
+                                        oh_list <- data.frame( geo_adamh = ohio_adamh$geo_adamh) }
+      if(input$strata == "geo_aaa") { oh_shape <- ohio_aaa
+                                      oh_list <- data.frame( geo_aaa = ohio_aaa$geo_aaa) }
+      if(input$strata == "geo_oei") { oh_shape <- ohio_oei
+                                      oh_list <- data.frame( geo_oei = ohio_oei$geo_oei) }
+      if(input$strata == "dem_countytype") {oh_shape <- ohio_ctype
+                                            oh_list <- data.frame( dem_countytype = ohio_ctype$dem_countytype) }
+      
+      data %>%
+        filter(year == input$yearUpper) %>%
+        ## conditional application of subpop filter
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        filter(!is.na(!!indic1)) %>%
+        ## between is inclusive of endpoints
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        group_by(!!geostrat1, !!indic1) %>%
+        tally() %>%
+        spread(!!indic1, n) %>%
+        adorn_totals("col") %>%
+        gather(!!indic1, n, 2:(ncol(.)-1)) %>%
+        rename("numerator" = "n", "denominator" = "Total") -> sns_geo
+      
+      data %>%
+        filter(year == input$yearUpper) %>%
+        mutate( !!indic1 := !!indic1 %>% as.factor(),
+                !!geostrat1 := !!geostrat1 %>% as.factor()) %>%      
+        as_survey_design(ids = 1,
+                         strata = stratum,
+                         weights = wt,
+                         lonely.psu=getOption("survey.lonely.psu"),
+                         na.rm = TRUE) %>%
+        ## apply subpopulation filter conditionally
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        ## remove NA rows
+        filter(!is.na(!!indic1)) %>%
+        ## between is inclusive of endpoints
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        ## apply stratification 
+        group_by(!!geostrat1, !!indic1) %>%
+        summarize(percEst = survey_mean( vartype = "se", na.rm=TRUE)) %>%
+        ## convert proportions to percents, apply rounding
+        mutate(
+          percEst = percEst %>% multi100(),
+          percEst_me = 100 * percEst_se * conflev,
+          percEst_l = (percEst - percEst_me) %>% round(percRound),
+          percEst_u = (percEst + percEst_me) %>% round(percRound),
+          margin = percEst - percEst_l) %>%
+        mutate(percEst = percEst %>% round(percRound)) -> res_geo
+      
+      res_geo <- res_geo %>%  
+        ## combine with ouput from sns 
+        right_join(sns_geo) %>% 
+        mutate(rse_suppress = ifelse((percEst_u - percEst)/conflev/percEst>sns_rse,TRUE,FALSE))  %>%
+        mutate(ct_suppress= ifelse(numerator<sns_num | denominator < sns_den , TRUE, FALSE)) %>%
+        mutate(cell_suppress = ifelse(rse_suppress == TRUE | ct_suppress == TRUE, TRUE, FALSE )) %>%
+        ## drop unnecessary columns
+        select(-numerator, -denominator, -rse_suppress, -ct_suppress) 
+      
+      ## in case of cell_suppress coming up empty, default to suppress
+      res_geo$cell_suppress[is.na(res_geo$cell_suppress)] <- TRUE
+      
+      ## replace suppressed values with NA
+      res_geo[res_geo$cell_suppress==TRUE, c('percEst', 'percEst_l', 'percEst_u' )] <- NA
+      
+      ## remove NAs which might cuase issues during merge with designated SF collection
+      est_obj <- res_geo %>%
+        rename(geo_name = !!geostrat1) %>%
+        mutate(geo_name = geo_name %>% as.character()) %>%
+        filter(geo_name != "") %>%
+        mutate(geo_name = geo_name %>% as.factor())%>%
+        filter(!!indic1 != "") 
+      
+      ## get list of levels for current demographic variable to specify columns in minichart:: functions
+      dem_opts <- data_adult_full %>%
+        filter(year == input$yearUpper) %>%
+        dplyr::distinct(!!indic1) %>% 
+        pull()
+      
+      ## assign region variable 'standardized' name to facilitate _join function
+      oh_shape <- oh_shape %>%
+        rename(geo_name = !!geostrat1)
+      
+      ## drop extraneous variables
+      est_obj <- est_obj %>% select(geo_name, !!indic1, percEst) %>%
+        ## make dataset wide (each factor level becomes its own column)
+        spread(!!indic1, percEst) %>%
+        left_join(oh_shape, by = c("geo_name" = "geo_name")) 
+      
+      indic_map  <- est_obj %>% 
+        ## coerce merged estimate object back to simple features collection (so leaflet recognizes it)
+        st_as_sf() %>%
+        leaflet(options = leafletOptions(zoomControl = FALSE,
+                                         minZoom = zoom_lev,
+                                         maxZoom = zoom_lev)) %>%
+        addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+        addPolygons(
+          fillColor = barColors[5],
+          color = "white",
+          weight=2,
+          opacity=1,
+          dashArray = "3",
+          fillOpacity= .7,
+          label = ~geo_name,
+          highlight = highlightOptions(
+            weight = 5,
+            color = "#666",
+            dashArray = "",
+            fillOpacity = 0.7)) %>%
+        addMinicharts(lng = est_obj$cent_lon, 
+                      lat = est_obj$cent_lat,
+                      type = "pie",
+                      chartdata = est_obj[,dem_opts],
+                      colorPalette = barColors,
+                      width = m_ch_size,
+                      layerId = est_obj$geo_name,
+                      transitionTime = 1,
+                      popup = popupArgs(showTitle = TRUE, 
+                                        showValues = TRUE, 
+                                        labels = NULL,
+                                        html = NULL,
+                                        noPopup = FALSE, 
+                                        digits = 2)) 
+    }else {
+      ########################
+      ## demographic variables for standard ohio map
+      ##  places piecharts via minicharts onto 'standard' 88 county map of ohio
+      
+      data %>%
+        filter(year == input$yearUpper) %>%
+        ## conditional application of subpop filter
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        filter(!is.na(!!indic1)) %>%
+        ## between is inclusive of endpoints
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        group_by(geo_countyname, !!indic1) %>%
+        tally() %>%
+        spread(!!indic1, n) %>%
+        adorn_totals("col") %>%
+        gather(!!indic1, n, 2:(ncol(.)-1)) %>%
+        rename("numerator" = "n", "denominator" = "Total") -> sns_geo
+      
+      data %>% 
+        filter(year == input$yearUpper) %>%
+        mutate(!!indic1 := !!indic1 %>% as.factor()) %>%      
+        as_survey_design(ids = 1,
+                         strata = stratum,
+                         weights = wt,
+                         lonely.psu=getOption("survey.lonely.psu"),
+                         na.rm = TRUE) %>%
+        ## apply subpopulation filter conditionally
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        ## don't show NA rows
+        filter(!is.na(!!indic1)) %>%
+        ## filter respondents by specified ages
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        ## filter respondents by specified FPL range
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        ## apply stratification conditionally
+        group_by(geo_countyname, !!indic1) %>%
+        summarize(percEst = survey_mean( vartype = "se", na.rm=TRUE),
+                  totalEst = survey_total( vartype = "se", na.rm = TRUE)) %>%
+        mutate(
+          percEst = percEst %>% multi100(),
+          percEst_me = 100 * percEst_se * conflev,
+          percEst_l = (percEst - percEst_me) %>% round(percRound),
+          percEst_u = (percEst + percEst_me) %>% round(percRound),
+          margin = percEst - percEst_l) %>%
+        mutate(percEst = percEst %>% round(percRound),
+               totalEst = totalEst %>% round(totalRound))  -> res_geo
+      
+      res_geo <- res_geo %>%
+        ## combine with ouput from sns 
+        right_join(sns_geo) %>% 
+        ## return true or false for each SNS condition
+        mutate(rse_suppress = ifelse((percEst_u - percEst)/conflev/percEst>sns_rse,TRUE,FALSE))  %>%
+        mutate(ct_suppress= ifelse(numerator<sns_num | denominator < sns_den , TRUE, FALSE)) %>%
+        mutate(cell_suppress = ifelse(rse_suppress == TRUE | ct_suppress == TRUE, TRUE, FALSE )) %>%
+        ## drop unnecessary columns
+        select(-numerator, -denominator, -rse_suppress, -ct_suppress) 
+      
+      ## in case of cell_suppress coming up empty, default to suppress
+      res_geo$cell_suppress[is.na(res_geo$cell_suppress)] <- TRUE
+      
+      ## replace suppressed values with NA
+      res_geo[res_geo$cell_suppress==TRUE, c('percEst', 'percEst_l', 'percEst_u')] <- NA
+      
+      ## pull list of factor levels for current demographic variable
+      dem_opts <- data_adult_full %>%
+        filter(year == input$yearUpper) %>%
+        dplyr::distinct(!!indic1) %>%
+        pull()
+      
+      ## make dataset wide
+      res_geo <- res_geo %>% select(geo_countyname, !!indic1, percEst) %>%
+        spread(!!indic1, percEst)
+      
+      oh_cent1 <- oh_cent %>% select(county, Latitude, Longitude)
+      
+      res_geo <- res_geo %>% left_join(oh_cent1, by = c("geo_countyname" = "county"))
+      
+      ohio1@data  <- res_geo %>% right_join(ohio@data, by= c("geo_countyname" = "NAME"))
+      
+      indic_map <- leaflet(options = leafletOptions(zoomControl = FALSE,
+                                                    minZoom = zoom_lev,
+                                                    maxZoom = zoom_lev)) %>%
+        addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+        addPolygons( data=ohio1,
+                     fillColor = barColors[5],
+                     color = "white",
+                     weight=2,
+                     opacity=1,
+                     dashArray = "3",
+                     fillOpacity= .7,
+                     label = "Click on piechart for estimates.",
+                     highlight = highlightOptions(
+                       weight = 5,
+                       color = "#666",
+                       dashArray = "",
+                       fillOpacity = 0.7)) %>%
+        addMinicharts(lng = ohio1@data$Longitude, 
+                      lat = ohio1@data$Latitude,
+                      type = "pie",
+                      chartdata = ohio1@data[,dem_opts],
+                      colorPalette = barColors,
+                      width = m_ch_size,
+                      layerId = paste0(ohio1@data$geo_countyname, " County"),
+                      transitionTime = 1,
+                      popup = popupArgs(showTitle = TRUE, 
+                                        showValues = TRUE, 
+                                        labels = NULL,
+                                        html = NULL,
+                                        noPopup = FALSE, 
+                                        digits = 2)) 
+    }
+  }else{
+    if(input$strata %in% geo_strata){
+      ########################
+      ## survey indicators for customized ohio maps for adamh, aaa, oei
+
+      geostrat1 <- sym(input$strata)
+      
+      ## eventually want a better way to do this
+      if(input$strata == "geo_adamh") { oh_shape <- ohio_adamh
+                                        oh_list <- data.frame( geo_adamh = ohio_adamh$geo_adamh) }
+      if(input$strata == "geo_aaa") { oh_shape <- ohio_aaa
+                                      oh_list <- data.frame( geo_aaa = ohio_aaa$geo_aaa) }
+      if(input$strata == "geo_oei") { oh_shape <- ohio_oei
+                                      oh_list <- data.frame( geo_oei = ohio_oei$geo_oei) }
+      if(input$strata == "dem_countytype") { oh_shape <- ohio_ctype
+                                             oh_list <- data.frame( dem_countytype = ohio_ctype$dem_countytype) }
+      
+      data %>%
+        filter(year == input$yearUpper) %>%
+        ## conditional application of subpop filter
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        filter(!is.na(!!indic1)) %>%
+        ## between is inclusive of endpoints
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        group_by(!!geostrat1, !!indic1) %>%
+        tally() %>%
+        spread(!!indic1, n) %>%
+        adorn_totals("col") %>%
+        gather(!!indic1, n, 2:(ncol(.)-1)) %>%
+        rename("numerator" = "n", "denominator" = "Total") %>% 
+        filter(!!indic1 == 1) -> sns_geo
+      
+      data %>%
+        filter(year == input$yearUpper) %>% 
+        mutate(!!geostrat1 := !!geostrat1 %>% as.factor()) %>%
+        as_survey_design(ids = 1,
+                         strata = stratum,
+                         weights = wt,
+                         lonely.psu=getOption("survey.lonely.psu"),
+                         na.rm = TRUE) %>%
+        ## apply subpopulation filter conditionally
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        ## remove NA rows
+        filter(!is.na(!!indic1)) %>%
+        ## between is inclusive of endpoints
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        ## apply stratification 
+        group_by(!!geostrat1) %>%
+        summarize(percEst = survey_mean(!!indic1 , vartype = "se", na.rm=TRUE),
+                  totalEst = survey_total(!!indic1, vartype = "se", na.rm = TRUE)) %>%
+        mutate(indicator = 1, ## placeholder for indicator column
+               percEst = percEst %>% multi100(),
+               percEst_me = 100 * percEst_se * conflev,
+               percEst_l = (percEst - percEst_me) %>% round(percRound),
+               percEst_u = (percEst + percEst_me) %>% round(percRound),
+               totalEst = totalEst,
+               totalEst_me = totalEst_se * conflev,
+               totalEst_l = (totalEst - totalEst_me) %>% round(totalRound),
+               totalEst_u = (totalEst + totalEst_me) %>% round(totalRound),
+               margin = percEst - percEst_l) %>%
+        mutate(percEst = percEst %>% round(percRound),
+               totalEst = totalEst %>% round(totalRound),
+               percEst_me = percEst_me %>% round(percRound),
+               totalEst_me = totalEst_me %>% round(totalRound)) -> res_geo
+      
+      res_geo <- res_geo %>%  
+        ## combine with ouput from sns 
+        right_join(sns_geo) %>% 
+        ## return true or false for each SNS condition
+        mutate(rse_suppress = ifelse((percEst_u - percEst)/conflev/percEst>sns_rse,TRUE,FALSE))  %>%
+        mutate(ct_suppress= ifelse(numerator<sns_num | denominator < sns_den , TRUE, FALSE)) %>%
+        mutate(cell_suppress = ifelse(rse_suppress == TRUE | ct_suppress == TRUE, TRUE, FALSE )) %>%
+        ## drop unnecessary columns
+        select(-numerator, -denominator, -rse_suppress, -ct_suppress) 
+      
+      ## in case of cell_suppress coming up empty, default to suppress
+      res_geo$cell_suppress[is.na(res_geo$cell_suppress)] <- TRUE
+      
+      ## replace suppressed values with NA
+      res_geo[res_geo$cell_suppress==TRUE, c('percEst', 'percEst_l', 'percEst_u', 'totalEst', 'totalEst_l', 'totalEst_u' )] <- NA
+      
+      res_geo <- res_geo %>% mutate(
+        totalEst = lapply(totalEst, function(x) prettyNum(x, big.mark = ",", trim=TRUE)),
+        totalEst_me = lapply(totalEst_me, function(x) prettyNum(x, big.mark = ",", trim=TRUE)),
+        label_1 = paste0("<u><b>",!!geostrat1, "</b></u>"),
+        label_2 = paste0("<i>Percent</i>: ", percEst, "% (±", percEst_me, "%)"),
+        label_3 = paste0("<i>Count</i>: ", totalEst, " (±", totalEst_me, ")")) %>%
+        mutate( label_2 = ifelse(cell_suppress==TRUE, "<i>Percent</i>: Insufficent Data", label_2),
+                label_3 = ifelse(cell_suppress==TRUE, "<i>Count</i>: Insufficent Data", label_3)) %>%
+        mutate(label_full = paste(label_1, label_2, label_3, sep = "<br/>")) %>%
+        mutate(label_html = lapply(label_full, function(x) HTML(x)))
+      
+      est_obj <- res_geo %>% 
+        ## replace indicator plcae holder with name of indicator variable (eg, "ins_esi")
+        mutate(indicator = ifelse(indicator==1, paste(input$indicator), indicator)) %>%
+        filter(indicator != "") 
+
+      ## specifies range of indicator values for color gradation, reassigns NA color to black
+      pal <- colorNumeric(c("#BEC0C4","#B22222","#700D1C"), domain = est_obj$percEst, na.color = "#000000")
+      
+      indic_map  <- est_obj %>% left_join(oh_shape) %>%
+        mutate(geo_name = !!geostrat1) %>%
+        st_as_sf() %>%
+        leaflet(options = leafletOptions(zoomControl = FALSE,
+                                         minZoom = zoom_lev,
+                                         maxZoom = zoom_lev)) %>%
+        addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+        addPolygons(
+          fillColor = ~pal(percEst),
+          color = "white",
+          weight=2,
+          opacity=1,
+          dashArray = "3",
+          fillOpacity= .7,
+          label = ~label_html,
+          labelOptions = labelOptions(style = list("font-size" = "14px")),          
+          highlight = highlightOptions(
+            weight = 5,
+            color = "#666",
+            dashArray = "",
+            # bringToFront = TRUE,
+            fillOpacity = 0.7)) %>%
+        addLegend("bottomright", pal = pal, values = est_obj$percEst,
+                  title = paste0(labels[(labels$VarName == input$indicator & labels$DashType == input$dash_type), "Interface_label"]), 
+                  na.label = paste("Insufficient data to provide reliable estimate"),                labFormat = labelFormat(suffix = "%"),
+                  opacity = 1)
+      
+    }else {
+      ########################      
+      ## survey indicators for standard ohio map
+      data %>%
+        filter(year == input$yearUpper) %>%
+        ## conditional application of subpop filter
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        #  filter(!is.na(!!indic1)) %>%
+        ## between is inclusive of endpoints
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        group_by(geo_countyname, !!indic1) %>%
+        tally() %>%
+        spread(!!indic1, n) %>%
+        #create dummy column so adorn_ includes first column-only needed in dichot/nostrat case
+        adorn_totals("col") %>%
+        gather(!!indic1, n, 2:(ncol(.)-1)) %>%
+        rename("numerator" = "n", "denominator" = "Total") %>% 
+        filter(!!indic1 == 1) -> sns_geo
+      
+      data %>% 
+        as_survey_design(ids = 1,
+                         strata = stratum,
+                         weights = wt,
+                         lonely.psu=getOption("survey.lonely.psu"),
+                         na.rm = TRUE) %>%
+        ## apply subpopulation filter conditionally
+        cond_filter(!!subpop1 == 1, execute=subpop_cond) %>%
+        ## don't show NA rows
+        filter(!is.na(!!indic1)) %>%
+        ## filter respondents by specified ages
+        filter(between(filter_age1, as.numeric(input$ageLower), as.numeric(ageUpper_placeHolder))) %>%
+        ## filter respondents by specified FPL range
+        filter(between(dem_income1, as.numeric(input$incomeLower), as.numeric(input$incomeUpper))) %>%
+        ## apply stratification conditionally
+        group_by(geo_countyname) %>%
+        summarize(percEst = survey_mean(!!indic1 , vartype = "se", na.rm=TRUE),
+                  totalEst = survey_total(!!indic1, vartype = "se", na.rm = TRUE)) %>%
+        mutate(indicator = 1, ## indicator column place holder
+               percEst = percEst %>% multi100(),
+               percEst_me = 100 * percEst_se * conflev,
+               percEst_l = (percEst - percEst_me) %>% round(percRound),
+               percEst_u = (percEst + percEst_me) %>% round(percRound),
+               totalEst = totalEst,
+               totalEst_me = totalEst_se * conflev,
+               totalEst_l = (totalEst - totalEst_me) %>% round(totalRound),
+               totalEst_u = (totalEst + totalEst_me) %>% round(totalRound)) %>%
+        mutate(percEst = percEst %>% round(percRound),
+               totalEst = totalEst %>% round(totalRound),
+               percEst_me = percEst_me %>% round(percRound),
+               totalEst_me = totalEst_me %>% round(totalRound)) -> res_geo
+      
+      res_geo <- res_geo %>%
+        ## combine with ouput from sns 
+        right_join(sns_geo) %>% 
+        mutate(rse_suppress = ifelse((percEst_u - percEst)/conflev/percEst>sns_rse,TRUE,FALSE))  %>%
+        mutate(ct_suppress= ifelse(numerator<sns_num | denominator < sns_den , TRUE, FALSE)) %>%
+        mutate(cell_suppress = ifelse(rse_suppress == TRUE | ct_suppress == TRUE, TRUE, FALSE )) %>%
+        ## drop unnecessary columns
+        select(-numerator, -denominator, -rse_suppress, -ct_suppress) 
+      
+      ## in case of cell_suppress coming up empty, default to suppress
+      res_geo$cell_suppress[is.na(res_geo$cell_suppress)] <- TRUE
+      
+      ## replace suppressed values with NA
+      res_geo[res_geo$cell_suppress==TRUE, c('percEst', 'percEst_l', 'percEst_u', 'totalEst', 'totalEst_l', 'totalEst_u')] <- NA
+      
+      
+      ### if all county estimates are empty
+      if(all(is.na(res_geo$percEst))){
+        res_geo <- empty_ohio
+        ohio1@data  <- res_geo %>% right_join(ohio@data, by= c("geo_countyname" = "NAME"))
+        
+        indic_map <- leaflet(options = leafletOptions(zoomControl = FALSE,
+                                                    minZoom = zoom_lev,
+                                                    maxZoom = zoom_lev)) %>%
+        addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+        addPolygons( data=ohio1,
+                     fillColor = "#000000",
+                     color = "white",
+                     weight=2,
+                     opacity=1,
+                     dashArray = "3",
+                     fillOpacity= .7,
+                     label = ~label_html,
+                     labelOptions = labelOptions(style = list("font-size" = "14px")),
+                     highlight = highlightOptions(
+                       weight = 5,
+                       color = "#666",
+                       dashArray = "",
+                       fillOpacity = 0.7,
+                       bringToFront = TRUE)) %>%
+        addLegend("bottomright", colors = c("#666"), labels = c("Insufficient data to provide reliable estimate"),
+                  title = paste(labels[(labels$VarName == input$indicator & labels$DashType == input$dash_type), "Interface_label"]), 
+                  na.label = paste("Insufficient data to <hr> provide reliable estimate"),
+                  labFormat = labelFormat(suffix = "%"),
+                  opacity = 1) 
+        
+      }else{
+        
+      
+      
+      res_geo <- res_geo %>% mutate(
+        totalEst = lapply(totalEst, function(x) prettyNum(x, big.mark = ",", trim=TRUE)),
+        totalEst_me = lapply(totalEst_me, function(x) prettyNum(x, big.mark = ",", trim=TRUE)),
+        label_1 = paste0("<u><b>",geo_countyname, " County </b></u>"),
+        label_2 = paste0("<i>Percent</i>: ", percEst, "% (±", percEst_me, "%)"),
+        label_3 = paste0("<i>Count</i>: ", totalEst, " (±", totalEst_me, ")")) %>%
+        mutate( label_2 = ifelse(cell_suppress==TRUE, "<i>Percent</i>: Insufficent Data", label_2),
+                label_3 = ifelse(cell_suppress==TRUE, "<i>Count</i>: Insufficent Data", label_3)) %>%
+        mutate(label_full = paste(label_1, label_2, label_3, sep = "<br/>")) %>%
+        mutate(label_html = lapply(label_full, function(x) HTML(x)))
+      
+      ohio1@data  <- res_geo %>% right_join(ohio@data, by= c("geo_countyname" = "NAME"))
+      
+      pal <- colorNumeric(c("#BEC0C4","#B22222","#700D1C"), domain = ohio1@data$percEst, na.color = "#000000")
+      
+      indic_map <- leaflet(options = leafletOptions(zoomControl = FALSE,
+                                                    minZoom = zoom_lev,
+                                                    maxZoom = zoom_lev)) %>%
+        addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+        addPolygons( data=ohio1,
+                     fillColor = ~pal(percEst),
+                     color = "white",
+                     weight=2,
+                     opacity=1,
+                     dashArray = "3",
+                     fillOpacity= .7,
+                     label = ~label_html,
+                     labelOptions = labelOptions(style = list("font-size" = "14px")),
+                     highlight = highlightOptions(
+                       weight = 5,
+                       color = "#666",
+                       dashArray = "",
+                       fillOpacity = 0.7,
+                       bringToFront = TRUE)) %>%
+        addLegend("bottomright", pal = pal, values = ohio1@data$percEst,
+                  title = paste(labels[(labels$VarName == input$indicator & labels$DashType == input$dash_type), "Interface_label"]), 
+                  na.label = paste("Insufficient data to <hr> provide reliable estimate"),
+                  labFormat = labelFormat(suffix = "%"),
+                  opacity = 1) 
+    }
+   }
+  }
+  indic_map
+  })
+})
+```
+
+```{r context="render"}
+div(class="omastitle", 
+    renderText(finalTitle())
+)
+div(style='height:750px; overflow-y: scroll; position: relative; display: block;', tags$img(src = "spinner.gif", id = "loading-spinner"),
+  leafletOutput("cn_map")
+)
+div(class="omascaption", renderUI(HTML(paste(finalCaption(), 
+                                             paste("Survey Year: ", input$yearUpper), 
+                                             sep = "</br>")))
+)
+```
+
+
+# About
+
+```{r context="server"}
+
+```
+
+```{r context="render"}
+includeHTML("about.html")
+```
+
